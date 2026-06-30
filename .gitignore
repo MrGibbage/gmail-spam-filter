@@ -1,0 +1,10 @@
+secrets/
+missed-spams/
+.venv/
+*.env
+token.json
+credentials.json
+__pycache__/
+*.pyc
+.pytest_cache/
+.env

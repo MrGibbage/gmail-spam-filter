@@ -1,0 +1,19 @@
+services:
+  gmail-spam-filter:
+    build: .
+    container_name: gmail-spam-filter
+    restart: unless-stopped
+    env_file:
+      - /etc/homelab/gmail-spam-filter.env
+    volumes:
+      - ./secrets:/secrets      # credentials.json + token.json (writable for token refresh)
+      - ./signals.yaml:/app/signals.yaml:ro  # signal definitions (read-only)
+      - spam_filter_data:/data  # state.json persists across restarts
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  spam_filter_data:

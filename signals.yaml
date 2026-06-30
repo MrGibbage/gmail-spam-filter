@@ -1,0 +1,58 @@
+# Spam signal definitions for gmail-spam-filter.
+# Types: regex | substring | any_substring | complex
+# Fields: x_gm_features | message_id | in_reply_to | return_path | body_text
+# To add a new signal: append an entry here, docker compose restart. No Python change needed.
+
+signals:
+  - id: 1
+    name: "Campaign 1: X-Gm-Features fingerprint"
+    field: x_gm_features
+    type: regex
+    pattern: '^AQt7F2rLGlvxzGKTC.*Tb6BMGUHcpBhWwzze9EE$'
+    note: "Prefix/suffix stable; middle rotates. Regex is immune to rotation."
+
+  - id: 2
+    name: "Campaign 1: Message-ID infrastructure substring"
+    field: message_id
+    type: substring
+    value: '+g9W_ddh+QDR18-tkYxyw01Rtjxhzw1NaGADQ'
+    note: "Common substring across old and new Message-ID variants."
+
+  - id: 3
+    name: "Campaign 1: Gibberish .edu domain in In-Reply-To"
+    field: in_reply_to
+    type: regex
+    pattern: '[a-z]{6,}-[a-z]{5,}\.edu'
+    flags: IGNORECASE
+    note: "Random consonant-heavy strings. Real universities have recognizable names."
+
+  - id: 4
+    name: "Campaign 1: IPv6 URL in body"
+    field: body_text
+    type: any_substring
+    values:
+      - 'http://[::ffff:'
+      - 'https://[::ffff:'
+    note: "IPv6-mapped IPv4 used to obscure link destination."
+
+  - id: 5
+    name: "Campaign 1: Addressed to stranger's personal email"
+    type: complex
+    function: check_stranger_address
+    note: >
+      Multi-recipient +tag-stripping logic. Implemented in signals.py —
+      cannot be expressed as a simple field check.
+
+  - id: 6
+    name: "Campaign 2: noReply_ Return-Path pattern"
+    field: return_path
+    type: regex
+    pattern: '^noReply_[a-z]{6,12}@'
+    note: "CamelCase noReply_ + random lowercase suffix. Subject irrelevant."
+
+  - id: 7
+    name: "Campaign 3: syclid= URL tracking parameter"
+    field: body_text
+    type: substring
+    value: 'syclid='
+    note: "Non-standard tracking param. Not used by any known legitimate ESP."
