@@ -34,8 +34,12 @@ rationale.
    GMAIL_USER=skip.morrow.mobile@gmail.com
    POLL_INTERVAL_SECONDS=60
    STATE_FILE=/data/state.json
-   SECRETS_DIR=/srv/gmail-spam-filter/secrets
+   SECRETS_DIR=/secrets
+   LOKI_URL=http://192.168.0.231:3100
+   LOKI_PUSH_ENABLED=true
    ```
+   `SECRETS_DIR` must be `/secrets` here — this env file is consumed *inside* the
+   container, where `docker-compose.yml` mounts `./secrets:/secrets`.
 5. `docker compose up -d` — check `docker logs gmail-spam-filter` for polling activity.
 
 ## Adding a new spam signal

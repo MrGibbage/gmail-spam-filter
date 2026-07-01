@@ -20,10 +20,28 @@ import sys
 
 from googleapiclient.errors import HttpError
 
+from spam_filter import loki_client
 from spam_filter.gmail_client import build_service, get_body_html, get_body_text
 
 DEFAULT_OUTPUT_DIR = '/srv/gmail-spam-filter/missed-spams/new'
 DEFAULT_SECRETS_DIR = '/srv/gmail-spam-filter/secrets'
+SERVICE_ENV_FILE = '/etc/homelab/gmail-spam-filter.env'
+
+
+def _load_loki_env(path: str = SERVICE_ENV_FILE) -> None:
+    """save_corpus.py runs as a bare host script (no Docker env_file), so pick up
+    LOKI_URL / LOKI_PUSH_ENABLED from the same env file Program 1 uses, unless
+    already set in the environment. Best-effort — missing file is not an error."""
+    if 'LOKI_URL' in os.environ:
+        return
+    try:
+        with open(path) as f:
+            for line in f:
+                key, _, value = line.strip().partition('=')
+                if key in ('LOKI_URL', 'LOKI_PUSH_ENABLED'):
+                    os.environ.setdefault(key, value)
+    except OSError:
+        pass
 
 
 def parse_args():
@@ -100,18 +118,21 @@ def save_thread(service, thread_id: str, output_dir: str) -> str:
     with open(filepath, 'w') as f:
         json.dump(record, f, indent=2)
 
+    loki_client.corpus_saved(thread_id, record['subject'], record['from'], filepath)
     return filepath
 
 
 def main():
     args = parse_args()
+    _load_loki_env()
 
     try:
-        service = build_service(args.secrets_dir)
+        service = build_service(args.secrets_dir, program='save_corpus')
     except FileNotFoundError:
         print(f'ERROR: No token.json found at {os.path.join(args.secrets_dir, "token.json")}')
         print('Run python3 run_auth.py on Windows to generate it, then copy to docker-server:/srv/gmail-spam-filter/secrets/')
         print('See DESIGN.md §Gmail OAuth setup.')
+        loki_client.error('auth_error', program='save_corpus', msg='token.json missing')
         sys.exit(2)
 
     saved = 0
@@ -123,6 +144,8 @@ def main():
             saved += 1
         except HttpError as e:
             print(f'ERROR: thread {thread_id} — {e}')
+            loki_client.error('api_error', program='save_corpus', service='gmail',
+                               status=e.resp.status, msg=str(e))
             errors += 1
         except Exception as e:
             print(f'ERROR: thread {thread_id} — {e}')

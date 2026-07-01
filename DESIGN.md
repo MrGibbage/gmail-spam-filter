@@ -582,6 +582,7 @@ candidates. The script takes over for the actual full-fidelity data fetch.
 │   ├── signals.py              ← signal evaluator: loads signals.yaml, implements Signal 5
 │   ├── gmail_client.py         ← Gmail API auth, history.list, messages.get, label ops
 │   ├── claude_client.py        ← Anthropic SDK call, prompt, response parsing
+│   ├── loki_client.py          ← structured Loki push (per-decision events, errors)
 │   └── state.py                ← historyId persistence (read/write state file)
 │
 ├── tests/
@@ -611,6 +612,8 @@ candidates. The script takes over for the actual full-fidelity data fetch.
 | `POLL_INTERVAL_SECONDS` | Polling cadence (default 60) | Program 1 only |
 | `STATE_FILE` | Path for historyId persistence | Program 1 only |
 | `SECRETS_DIR` | Path to credentials.json + token.json | Both |
+| `LOKI_URL` | Loki push endpoint, e.g. `http://192.168.0.231:3100` | Both |
+| `LOKI_PUSH_ENABLED` | Set to `false` to disable Loki push without removing the var (default: `true`) | Both |
 
 `save_corpus.py` reads `SECRETS_DIR` and `GMAIL_USER` from environment (or CLI flags).
 It does not need `ANTHROPIC_API_KEY` or `STATE_FILE`.
@@ -624,6 +627,8 @@ GMAIL_USER=skip.morrow.mobile@gmail.com
 POLL_INTERVAL_SECONDS=60
 STATE_FILE=/data/state.json
 SECRETS_DIR=/srv/gmail-spam-filter/secrets
+LOKI_URL=http://192.168.0.231:3100
+LOKI_PUSH_ENABLED=true
 ```
 
 Add this service to `.claude/homelab-services.md` using the same format as existing entries.
@@ -948,6 +953,291 @@ contents, or credentials.json contents.
 
 ---
 
+## Loki logging
+
+Structured Loki push gives per-decision forensic data queryable in Grafana by signal,
+campaign, action, and date. This is the layer that would have made the 2026-06-30 incident
+immediately visible: a panel of "emails evaluated, no signal matched" would have shown the
+three Campaign 3 emails accumulating at `action=claude_fallback` before the pattern was
+identified.
+
+### Two-layer approach
+
+**Layer 1 — structured push from Python (per-decision events):**
+The program posts one JSON log line per filter decision to `/loki/api/v1/push`. Labels
+are queryable in LogQL. No extra library needed — `urllib.request` handles it.
+
+**Layer 2 — container stdout scraping (operational events):**
+If Alloy or promtail is already running on docker-server and scraping Docker container
+logs, the container's stdout (INFO/WARNING/ERROR lines) appears in Loki automatically
+with no code change. Check with `docker ps | grep -E "alloy|promtail"`. If neither is
+running, stdout logs are `docker logs`-only. Adding Alloy is a future step — it requires
+no changes to this program.
+
+### Label schema
+
+All structured pushes use these stream labels (low-cardinality — fine as labels):
+
+```
+{job="gmail-spam-filter", host="docker-server", program="main"}
+```
+
+For `save_corpus.py` events:
+```
+{job="gmail-spam-filter", host="docker-server", program="save_corpus"}
+```
+
+Per-event data goes in the **log line as JSON** — never as labels. High-cardinality
+values (thread_id, subject, from) must not be labels or Loki's index explodes.
+
+### Log line schemas
+
+**filter_decision** (one per email evaluated):
+```json
+{
+  "level": "INFO",
+  "event": "filter_decision",
+  "thread_id": "19f19b7603f22a5e",
+  "subject": "Re: [EXTERNAL] – WARNING",
+  "from_addr": "admissions@belowtheprice.com",
+  "action": "marked_spam",
+  "signal_id": 7,
+  "signal_name": "Campaign 3: syclid= URL tracking parameter",
+  "claude_used": false,
+  "claude_confidence": null,
+  "claude_reason": null,
+  "return_path": "noReply_tuiftndq@fit001.com",
+  "x_gm_features": "AQt7F2rLGlvxzGKTC1NaGADQ1A8RjTb6BMGUHcpBhWwzze9EE",
+  "message_id": "CABW1v11...NaGADQ...@autodiscover.mychaeldanna.com",
+  "in_reply_to": "",
+  "sender": "",
+  "to_addrs": ["skip.morrow.mobile@gmail.com"]
+}
+```
+
+Full header values are included (2026-07-01 decision — see below), not just which signal
+matched. This turns "Claude caught something a signal almost matched" from a
+`save_corpus.py` round-trip into a glance at the log line: compare the raw
+`x_gm_features`/`return_path`/`message_id`/`in_reply_to` string directly against known
+campaign fingerprints. Two signals get no extra visibility from this — Signal 4 (IPv6 URL)
+and Signal 7 (`syclid=`) are body-dependent, and body text is deliberately excluded (see
+below), so near-misses on those two still require `save_corpus.py` to diagnose.
+
+`action` is one of: `marked_spam` | `passed` | `claude_fallback_spam` | `claude_fallback_passed`
+
+Use `claude_fallback_spam` / `claude_fallback_passed` when Claude made the call (no signal
+matched) — this separates deterministic catches from Claude catches in queries.
+
+**poll_complete** (one per poll cycle):
+```json
+{"level": "INFO", "event": "poll_complete", "checked": 3, "marked_spam": 2, "next_poll_s": 60}
+```
+
+**corpus_saved** (one per file written by save_corpus.py):
+```json
+{
+  "level": "INFO",
+  "event": "corpus_saved",
+  "thread_id": "19f19b7603f22a5e",
+  "subject": "Re: [EXTERNAL] – WARNING",
+  "from_addr": "admissions@belowtheprice.com",
+  "output_path": "/srv/gmail-spam-filter/missed-spams/new/2026-06-30_19f19b7603f22a5e.json"
+}
+```
+
+**error events** (`level: "ERROR"`):
+```json
+{"level": "ERROR", "event": "api_error", "service": "gmail", "status": 429, "msg": "..."}
+{"level": "ERROR", "event": "auth_error", "msg": "token.json missing"}
+{"level": "WARNING", "event": "history_reset", "old_history_id": "12345", "new_history_id": "99999"}
+{"level": "WARNING", "event": "token_refresh", "msg": "OAuth token refreshed"}
+```
+
+### What NOT to include in log lines
+
+- Body text or body_html — not a privacy concern (see below), but a size/cost one:
+  `filter_decision` fires on every evaluated email, spam or not, so unbounded body content
+  would make Loki's storage grow far faster than header values do. If body-signal tuning
+  (Signal 4 IPv6 URL, Signal 7 syclid=) is needed, use `save_corpus.py` instead.
+- Anthropic API key, token.json contents, credentials.json
+
+**2026-07-01 decision — full header values (Return-Path, X-Gm-Features, Message-ID,
+In-Reply-To, Sender, To) are included**, not just signal_id/signal_name. Originally this
+doc excluded them on cardinality grounds, but that concern only applies to Loki *stream
+labels* (the index) — these values live in the JSON log line body, which Loki doesn't
+index, so there's no cardinality cost. The owner's call: no information in these headers
+is more sensitive than what's already logged (subject, from_addr), and anyone with Loki
+access would have Gmail access anyway. Retention is whatever this Loki instance is
+configured for globally (currently 7 days, `retention_period` in `loki-config.yaml`) —
+not configurable per-application, so this data ages out automatically with everything else.
+
+### loki_client.py
+
+```python
+import json
+import os
+import time
+import urllib.request
+
+
+def _push(program: str, level: str, event: str, **fields):
+    # Read env fresh on every call, not once at import: main.py's container gets
+    # LOKI_URL from Docker's env_file before the process starts, but save_corpus.py
+    # runs as a bare host script over ssh_exec and may set os.environ after import.
+    url = os.environ.get('LOKI_URL', '').rstrip('/')
+    enabled = os.environ.get('LOKI_PUSH_ENABLED', 'true').lower() != 'false'
+    if not enabled or not url:
+        return
+    line = json.dumps({'level': level, 'event': event, **fields})
+    payload = json.dumps({
+        'streams': [{
+            'stream': {'job': 'gmail-spam-filter', 'host': 'docker-server', 'program': program},
+            'values': [[str(time.time_ns()), line]],
+        }]
+    }).encode()
+    req = urllib.request.Request(
+        f'{url}/loki/api/v1/push',
+        data=payload,
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    try:
+        urllib.request.urlopen(req, timeout=3).close()
+    except Exception:
+        pass  # never let Loki failure crash the filter
+
+
+def filter_decision(thread_id, subject, from_addr, action,
+                     signal_id=None, signal_name=None,
+                     claude_used=False, claude_confidence=None, claude_reason=None,
+                     return_path=None, x_gm_features=None, message_id=None,
+                     in_reply_to=None, sender=None, to_addrs=None):
+    _push('main', 'INFO', 'filter_decision',
+          thread_id=thread_id, subject=subject, from_addr=from_addr,
+          action=action, signal_id=signal_id, signal_name=signal_name,
+          claude_used=claude_used, claude_confidence=claude_confidence,
+          claude_reason=claude_reason,
+          return_path=return_path, x_gm_features=x_gm_features, message_id=message_id,
+          in_reply_to=in_reply_to, sender=sender, to_addrs=to_addrs)
+
+
+def poll_complete(checked: int, marked_spam: int, next_poll_s: int):
+    _push('main', 'INFO', 'poll_complete',
+          checked=checked, marked_spam=marked_spam, next_poll_s=next_poll_s)
+
+
+def corpus_saved(thread_id, subject, from_addr, output_path):
+    _push('save_corpus', 'INFO', 'corpus_saved',
+          thread_id=thread_id, subject=subject, from_addr=from_addr,
+          output_path=output_path)
+
+
+def warn(event: str, program: str = 'main', **fields):
+    _push(program, 'WARNING', event, **fields)
+
+
+def error(event: str, program: str = 'main', **fields):
+    _push(program, 'ERROR', event, **fields)
+```
+
+### Calling it from main.py
+
+```python
+import re
+from . import loki_client
+
+_SIGNAL_REASON_RE = re.compile(r'^Signal (\d+): (.*)$')
+
+def _parse_signal_reason(reason: str):
+    m = _SIGNAL_REASON_RE.match(reason)
+    return (int(m.group(1)), m.group(2)) if m else (None, reason)
+
+# After each filter decision:
+matched, reason = run_signals(fields)
+signal_id = signal_name = None
+claude_used = False
+claude_confidence = claude_reason = None
+if matched:
+    mark_spam(service, msg_id)
+    signal_id, signal_name = _parse_signal_reason(reason)
+    action = 'marked_spam'
+else:
+    claude_used = True
+    result = call_claude(fields)
+    claude_confidence, claude_reason = result['confidence'], result['reason']
+    action = 'claude_fallback_spam' if result['spam'] else 'claude_fallback_passed'
+    if result['spam']:
+        mark_spam(service, msg_id)
+
+loki_client.filter_decision(
+    thread_id=msg_id, subject=fields['subject'], from_addr=fields['from_addr'],
+    action=action, signal_id=signal_id, signal_name=signal_name,
+    claude_used=claude_used, claude_confidence=claude_confidence, claude_reason=claude_reason,
+    return_path=fields.get('return_path'), x_gm_features=fields.get('x_gm_features'),
+    message_id=fields.get('message_id'), in_reply_to=fields.get('in_reply_to'),
+    sender=fields.get('sender'), to_addrs=fields.get('to_addrs'),
+)
+
+# At end of poll cycle:
+loki_client.poll_complete(checked=n_checked, marked_spam=n_spam, next_poll_s=POLL_INTERVAL)
+```
+
+### Calling it from save_corpus.py
+
+```python
+import loki_client
+# after writing the file:
+loki_client.corpus_saved(thread_id, fields['subject'], fields['from_addr'], output_path)
+```
+
+### Finding the Loki URL
+
+```bash
+# On docker-server:
+docker ps | grep loki
+# Look for a container with port 3100. The URL is http://192.168.0.231:3100
+# Or check Grafana → Settings → Data Sources → Loki → URL field
+```
+
+Confirm the address before setting `LOKI_URL` in the env file. If Loki is behind Caddy
+with auth, check `.claude/homelab-services.md` for whether an internal bypass URL exists.
+
+### Useful LogQL queries for Grafana
+
+```logql
+# All spam caught (deterministic signals only)
+{job="gmail-spam-filter"} | json | event=`filter_decision` | action=`marked_spam`
+
+# Emails Claude had to evaluate (no signal matched — watch this for new campaigns)
+{job="gmail-spam-filter"} | json | event=`filter_decision` | claude_used=`true`
+
+# Emails that reached Claude AND got through (potential false negatives)
+{job="gmail-spam-filter"} | json | event=`filter_decision` | action=`claude_fallback_passed`
+
+# Signal 7 hits specifically
+{job="gmail-spam-filter"} | json | event=`filter_decision` | signal_id=`7`
+
+# Claude fallback catches — compare x_gm_features against known campaign fingerprints
+# to spot infrastructure variants Signal 1 doesn't match yet
+{job="gmail-spam-filter"} | json | event=`filter_decision` | action=`claude_fallback_spam`
+  | line_format `{{.x_gm_features}} | {{.return_path}} | {{.message_id}}`
+
+# All errors
+{job="gmail-spam-filter"} | json | level=`ERROR`
+
+# Corpus saves (emails sent to manual analysis)
+{job="gmail-spam-filter"} | json | event=`corpus_saved`
+
+# Daily spam count panel (Grafana time series)
+sum(count_over_time({job="gmail-spam-filter"} | json | event=`filter_decision` | action=`marked_spam` [$__interval]))
+```
+
+The `claude_used=true, action=claude_fallback_passed` query is the early-warning panel:
+it shows emails that slipped past all signals AND past Claude. A spike here means a new
+campaign is active — check those subjects and senders before adding a new signal.
+
+---
+
 ## GitHub repo setup
 
 Repo name suggestion: `gmail-spam-filter` under MrGibbage account.
@@ -1041,7 +1331,11 @@ poll loop is completing cycles. A container that is running but hung shows as un
    `curl -X POST http://192.168.0.231:5678/api/v1/workflows/4L6yy2QKRLMAW3y3/deactivate -H "X-N8N-API-KEY: $N8N_API_KEY"`
 10. Run deactivated n8n + active Python for 1 week as shadow check
 11. After 1 week stable: delete n8n workflow, update Holocron, push to GitHub
-12. Update `scheduled-tasks.md` in the Holocron — add gmail-spam-filter as a Docker service
+12. Verify Loki logging: run a manual filter cycle, then check
+    `{job="gmail-spam-filter"}` in Grafana — confirm `filter_decision` and `poll_complete`
+    events are arriving. If `LOKI_URL` is wrong the filter still works (push failures are
+    swallowed), but fix it before declaring the migration done.
+13. Update `scheduled-tasks.md` in the Holocron — add gmail-spam-filter as a Docker service
     (not a cron job), document the 60-second internal poll loop, restart policy, and
     healthcheck command
 
@@ -1049,6 +1343,12 @@ poll loop is completing cycles. A container that is running but hung shows as un
 
 ## What NOT to do
 
+- **Do not put high-cardinality values (thread_id, subject, From address) in Loki stream
+  labels.** They go in the JSON log line only. Loki's index is built from labels; unique
+  values per log line will exhaust Loki's label index and degrade query performance.
+- **Do not let Loki push failures propagate as exceptions.** The `_push()` function
+  wraps `urlopen` in a bare `except Exception: pass` — this is intentional. A Loki outage
+  must not take down the spam filter.
 - **Do not embed signal patterns in Python code.** All regex/substring signals belong in
   `signals.yaml`. Only Signal 5 (multi-recipient +tag logic) lives in `signals.py`.
   Adding a new campaign should require a YAML edit, not a code change.

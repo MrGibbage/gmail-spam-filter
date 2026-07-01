@@ -4,12 +4,17 @@ Shared by both programs: the automatic filter (spam_filter/main.py) and the
 on-demand corpus saver (save_corpus.py).
 """
 import base64
+import logging
 import re
 from pathlib import Path
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+
+from . import loki_client
+
+logger = logging.getLogger(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 
@@ -20,7 +25,7 @@ PERSONAL_DOMAINS = {
 MY_ADDRESSES = {'skip.morrow.mobile@gmail.com', 'skipmorrowmobile@gmail.com'}
 
 
-def load_credentials(secrets_dir: str) -> Credentials:
+def load_credentials(secrets_dir: str, program: str = 'main') -> Credentials:
     """Load token.json, refreshing it if expired. Raises FileNotFoundError if missing."""
     token_path = Path(secrets_dir) / 'token.json'
     if not token_path.exists():
@@ -31,11 +36,13 @@ def load_credentials(secrets_dir: str) -> Credentials:
         creds.refresh(Request())
         with open(token_path, 'w') as f:
             f.write(creds.to_json())
+        logger.warning('OAuth token refreshed')
+        loki_client.warn('token_refresh', program=program, msg='OAuth token refreshed')
     return creds
 
 
-def build_service(secrets_dir: str):
-    creds = load_credentials(secrets_dir)
+def build_service(secrets_dir: str, program: str = 'main'):
+    creds = load_credentials(secrets_dir, program=program)
     return build('gmail', 'v1', credentials=creds)
 
 
