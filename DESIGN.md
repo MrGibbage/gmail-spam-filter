@@ -252,8 +252,19 @@ Respond ONLY with JSON (no markdown): {"spam": true or false, "reason": "one sen
 ```
 
 Model: `claude-haiku-4-5-20251001`
-Max tokens: 200
+Max tokens: 300 (originally 200 — see gotcha below)
 Mark spam if: `spam == True and confidence > 75`
+
+**Gotcha found 2026-07-01, via Loki: 100% of live fallback calls failed to parse.**
+Despite "Respond ONLY with JSON (no markdown)", Haiku wraps essentially every response in
+a ` ```json ... ``` ` fence, and some responses were also truncated mid-JSON because 200
+tokens wasn't enough headroom for the fence plus a verbose `reason` string. Both defeat a
+bare `json.loads()`. Fix: `claude_client._parse_json_response()` strips a leading/trailing
+markdown fence before parsing, and `MAX_TOKENS` was raised to 300 for safety margin. Until
+this fix, every email that reached the Claude fallback (i.e. didn't match a deterministic
+signal) silently defaulted to `spam: false` — the fallback safety net was effectively dead
+the whole time, though no real spam slipped through it in practice since every campaign
+caught so far matched a deterministic signal.
 
 ---
 

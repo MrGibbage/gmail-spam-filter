@@ -5,13 +5,14 @@ costs near zero while still catching campaigns that haven't been fingerprinted y
 """
 import json
 import logging
+import re
 
 from anthropic import Anthropic
 
 logger = logging.getLogger(__name__)
 
 MODEL = 'claude-haiku-4-5-20251001'
-MAX_TOKENS = 200
+MAX_TOKENS = 300
 CONFIDENCE_THRESHOLD = 75
 
 PROMPT_TEMPLATE = """You are a spam filter for skip.morrow.mobile@gmail.com. You check ONLY for these specific
@@ -81,6 +82,17 @@ Body: {body}
 Respond ONLY with JSON (no markdown): {{"spam": true or false, "reason": "one sentence", "confidence": 0-100}}"""
 
 
+def _parse_json_response(raw: str) -> dict:
+    """Strip an optional ```json ... ``` markdown fence — Haiku adds one on most calls
+    despite the prompt's "no markdown" instruction — then parse. Raises
+    json.JSONDecodeError on genuinely malformed/truncated JSON; caller decides the fallback."""
+    raw = raw.strip()
+    if raw.startswith('```'):
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+    return json.loads(raw.strip())
+
+
 def classify(fields: dict, api_key: str) -> dict:
     """Call Claude Haiku to classify an email. Returns {'spam': bool, 'reason': str, 'confidence': int}.
 
@@ -107,7 +119,7 @@ def classify(fields: dict, api_key: str) -> dict:
     raw = response.content[0].text.strip()
 
     try:
-        result = json.loads(raw)
+        result = _parse_json_response(raw)
     except json.JSONDecodeError:
         logger.warning('Claude returned non-JSON response: %.200s', raw)
         return {'spam': False, 'reason': 'unparseable Claude response', 'confidence': 0}
