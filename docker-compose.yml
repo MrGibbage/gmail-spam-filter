@@ -5,6 +5,8 @@ services:
     restart: unless-stopped
     env_file:
       - /etc/homelab/gmail-spam-filter.env
+    environment:
+      - POLL_INTERVAL_SECONDS=15
     volumes:
       - ./secrets:/secrets      # credentials.json + token.json (writable for token refresh)
       - ./signals.yaml:/app/signals.yaml:ro  # signal definitions (read-only)
