@@ -183,12 +183,31 @@ def main():
         sys.exit(2)
 
     poll_num = 0
+    consecutive_failures = 0
     while True:
         poll_num += 1
         try:
             checked, marked_spam = poll(service, state_file, anthropic_api_key, poll_num)
-        except Exception:
+            consecutive_failures = 0
+        except Exception as e:
+            consecutive_failures += 1
             logger.exception('Unhandled error during poll #%d', poll_num)
+            # Unlike the HttpError catches inside poll()/process_message (which already
+            # push to Loki), a top-level exception here — e.g. RefreshError on a
+            # revoked/expired OAuth grant — previously reached stdout only, never the
+            # structured job= stream. That made it invisible to any Loki-based alert.
+            loki_client.error(
+                'poll_error', error_type=type(e).__name__, msg=str(e),
+                consecutive_failures=consecutive_failures,
+            )
+            if consecutive_failures >= 3:
+                # Distinct from poll_error so an alert can watch for this specifically
+                # without paging on a single transient network blip (which resolves
+                # itself next tick and never reaches this branch).
+                loki_client.error(
+                    'filter_degraded', error_type=type(e).__name__, msg=str(e),
+                    consecutive_failures=consecutive_failures,
+                )
             checked, marked_spam = 0, 0
             # Still record that we're alive so the healthcheck doesn't flap on a
             # transient per-message error.
