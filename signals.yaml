@@ -56,3 +56,17 @@ signals:
     type: substring
     value: 'syclid='
     note: "Non-standard tracking param. Not used by any known legitimate ESP."
+
+  - id: 8
+    name: "Campaign 4: 1NaGADQ Message-ID tag (fake verification codes)"
+    field: message_id
+    type: substring
+    value: '1NaGADQ'
+    note: >
+      Added 2026-11-25. Campaign tag embedded in the Message-ID across every sending
+      platform this operation uses (Outlook/Exchange Online, SES, SendGrid, mailersend,
+      Salesforce MC). Main target: "<Brand>-Alert/-Desk verification code" spam that only
+      the Claude fallback was catching. Validated against all Loki decisions 2026-11-19..25:
+      matched 13/13 spam (all campaigns) and 0/596 legitimate. The June 2026 Campaign 1 corpus
+      sample carries it too (Signal 2's substring ends in it). Case-sensitive on purpose: a
+      random 7-char base64 match is ~1e-11 per message.
